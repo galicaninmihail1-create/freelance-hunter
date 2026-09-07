@@ -1,0 +1,32 @@
+[Unit]
+Description=Freelance Hunter Live Canary v1
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=freelance-hunter
+Group=freelance-hunter
+WorkingDirectory=/opt/freelance-hunter/current
+EnvironmentFile=/etc/freelance-hunter/hunter.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/freelance-hunter/venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8765 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+StateDirectory=freelance-hunter
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/freelance-hunter
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
