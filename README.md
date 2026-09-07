@@ -82,6 +82,22 @@ Drafts are never submitted to FL.ru. Repeated button presses reuse the saved dra
 
 ## Running
 
+### Bounded one-shot live canary
+
+The diagnostic CLI performs one RSS fetch, materializes at most 1–3 new unique
+non-historical candidates, and exits without starting FastAPI, Uvicorn, or a
+background scheduler. The explicit Telegram destination confirmation is mandatory.
+With dedupe verification enabled, the second pass reuses the exact fixed candidate
+batch from the first pass and cannot advance to later RSS items.
+
+```powershell
+python -m app.live_canary_once --max-new-jobs 1 --verify-dedupe --confirm-telegram-destination
+```
+
+Review the configured Telegram destination before supplying the confirmation flag.
+Omitting the limit or confirmation, or using a limit outside `1..3`, terminates before
+any network request.
+
 ```powershell
 python -m pip install -e ".[dev]"
 python -m uvicorn app.main:app
