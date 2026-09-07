@@ -165,14 +165,36 @@ def format_job_message(job: Job, scoring: ScoringEngine) -> str:
     )
 
 
-def keyboard_for(job: Job) -> dict:
-    return {"inline_keyboard": [
+def keyboard_for(job: Job, *, include_draft: bool = True) -> dict:
+    rows = [
         [
             {"text": "🔥 Интересно", "callback_data": f"interested:{job.id}"},
             {"text": "👎 Не подходит", "callback_data": f"rejected:{job.id}"},
         ],
-        [{"text": "✍️ Подготовить отклик", "callback_data": f"draft_requested:{job.id}"}],
-    ]}
+    ]
+    if include_draft:
+        rows.append([{"text": "✍️ Подготовить отклик", "callback_data": f"draft_requested:{job.id}"}])
+    return {"inline_keyboard": rows}
+
+
+def format_fallback_job_message(job: Job) -> str:
+    description = " ".join((job.description or "").split())
+    description_line = html.escape(description[:1000]) if description else "Описание заказа отсутствует в RSS"
+    category_line = (
+        f"🗂 Категория: {html.escape(job.category)}\n"
+        if job.category and job.category.strip()
+        else ""
+    )
+    link = html.escape(job.url or "", quote=True)
+    link_line = f'<a href="{link}">🔗 Открыть заказ на FL.ru</a>' if link else "🔗 Ссылка на заказ отсутствует"
+    return (
+        f"🔥 <b>{html.escape(job.title)}</b>\n\n"
+        f"💰 Бюджет: {html.escape(_budget(job))}\n"
+        f"{category_line}\n"
+        "⚠️ AI-анализ временно недоступен\n\n"
+        f"<b>Описание из RSS</b>\n{description_line}\n\n"
+        f"{link_line}"
+    )
 
 
 class TelegramClient:
@@ -184,14 +206,14 @@ class TelegramClient:
     def enabled(self) -> bool:
         return bool(self.token and self.chat_id)
 
-    async def notify(self, job: Job, scoring: ScoringEngine) -> bool:
+    async def notify(self, job: Job, scoring: ScoringEngine, *, fallback: bool = False) -> bool:
         if not self.enabled:
             return False
         payload = {
             "chat_id": self.chat_id,
-            "text": format_job_message(job, scoring),
+            "text": format_fallback_job_message(job) if fallback else format_job_message(job, scoring),
             "parse_mode": "HTML",
-            "reply_markup": keyboard_for(job),
+            "reply_markup": keyboard_for(job, include_draft=not fallback),
             "disable_web_page_preview": True,
         }
         return await self._post("sendMessage", payload, "notification", job.id)

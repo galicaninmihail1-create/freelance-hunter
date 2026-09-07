@@ -2,7 +2,7 @@
 
 Monitored opportunity discovery for the official FL.ru “Business automation” RSS feed:
 
-`RSS → normalization → persistent dedupe → hard filter → analyzer_v1 → deterministic scoring → Telegram`
+`RSS → normalization → persistent dedupe → analytical enrichment → enriched/fallback Telegram card`
 
 The service never applies to jobs or contacts clients. FL.ru HTML scraping, Kwork, automatic applications, and automatic score calibration are outside this version.
 
@@ -47,7 +47,7 @@ tables.
 python -m app.dry_run_live_canary
 ```
 
-It reports RSS items, new jobs, duplicates, hard-filtered jobs, jobs that would need AI, and existing analyzed jobs that meet the Telegram threshold.
+It reports RSS items, new notification candidates, duplicates, hard-filtered jobs, jobs that would need AI, and the legacy diagnostic count of existing analyzed jobs above the Telegram threshold.
 The report also includes each official feed name, items seen, new unique jobs attributed
 to that feed, and duplicates already seen in another feed during the same poll.
 It also reports newly onboarded feeds, historical identities suppressed before the
@@ -55,7 +55,11 @@ pipeline, and groups of feeds whose current stable identity sets are identical.
 
 ## Telegram behavior
 
-Eligible jobs receive one compact card. A durable reservation is written before sending, so a restart does not produce a duplicate notification.
+Every new unique non-historical job receives one Telegram delivery attempt. Hard-filter
+classification and score remain analytical data and never block that attempt. Successful
+analysis produces the enriched card; an analysis or enrichment failure produces a
+source-facts-only fallback card with no AI draft button. A durable reservation is written
+before sending, so a restart does not produce a duplicate notification.
 
 On the first live startup, every job already present in SQLite is durably classified as
 `suppressed_pre_live`. RSS duplicates are never sent from the historical/dedupe path;

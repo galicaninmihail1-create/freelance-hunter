@@ -1,10 +1,11 @@
+import json
 import logging
 
 import httpx
 
 from app.models import BudgetStatus, Job
 from app.scoring import ScoringEngine
-from app.telegram.client import TelegramClient, format_job_message, keyboard_for
+from app.telegram.client import TelegramClient, format_fallback_job_message, format_job_message, keyboard_for
 
 
 def test_telegram_format_and_buttons() -> None:
@@ -61,6 +62,51 @@ def test_source_budget_range_is_formatted_without_using_ai_estimate() -> None:
     unknown_text = format_job_message(unknown, ScoringEngine())
     assert "💰 Бюджет: не указан в RSS" in unknown_text
     assert "999" not in unknown_text
+
+
+def test_fallback_card_uses_only_source_facts_and_has_no_draft_action() -> None:
+    job = Job(
+        source="fl.ru", title="<Новый заказ>", description="Описание из RSS",
+        category="API", url="https://example.test/job",
+        budget_min=7000, budget_max=12000, currency="RUB",
+        source_budget_status=BudgetStatus.PROVIDED,
+        recommended_price=999999, final_score=0, codex_share=0,
+        complexity_score=0, analysis_confidence=0,
+    )
+
+    text = format_fallback_job_message(job)
+    buttons = keyboard_for(job, include_draft=False)["inline_keyboard"]
+
+    assert "⚠️ AI-анализ временно недоступен" in text
+    assert "7 000–12 000 ₽" in text
+    assert "999999" not in text and "999 999" not in text
+    assert "0/100" not in text
+    assert "0%" not in text
+    assert "0/10" not in text
+    assert "Описание из RSS" in text
+    assert "API" in text
+    assert all(
+        button["callback_data"] != f"draft_requested:{job.id}"
+        for row in buttons for button in row
+    )
+
+
+async def test_telegram_client_selects_fallback_payload_and_keyboard() -> None:
+    captured: dict = {}
+
+    async def capture(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    job = Job(source="fl.ru", title="Fallback", description="Source description")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(capture)) as http_client:
+        sent = await TelegramClient("test-token", "42", client=http_client).notify(
+            job, ScoringEngine(), fallback=True,
+        )
+
+    assert sent is True
+    assert "⚠️ AI-анализ временно недоступен" in captured["text"]
+    assert len(captured["reply_markup"]["inline_keyboard"]) == 1
 
 
 async def test_raw_telegram_token_is_absent_from_httpx_logs(caplog) -> None:

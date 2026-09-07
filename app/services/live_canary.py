@@ -59,6 +59,7 @@ class LiveRunReport:
     malformed_items: int = 0
     cross_feed_duplicates: int = 0
     historical_suppressed: int = 0
+    new_notification_candidates: int = 0
     feeds: list[FeedRunReport] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
@@ -76,6 +77,7 @@ class DryRunReport:
     malformed_items: int = 0
     cross_feed_duplicates: int = 0
     historical_suppressed: int = 0
+    new_notification_candidates: int = 0
     feeds: list[FeedRunReport] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, object]:
@@ -231,11 +233,11 @@ class LiveCanaryService:
                         report.existing_analysis_telegram_eligible += 1
                     continue
                 report.new_jobs += 1
+                report.new_notification_candidates += 1
                 current_feed.new_unique_jobs += 1
                 if not self.hard_filter.evaluate(job).accepted:
                     report.hard_filtered += 1
-                else:
-                    report.jobs_requiring_ai += 1
+                report.jobs_requiring_ai += 1
             except Exception:
                 report.malformed_items += 1
         return report
@@ -290,48 +292,66 @@ class LiveCanaryService:
             return
 
         report.new_jobs += 1
+        report.new_notification_candidates += 1
         self.repository.save(job, key)
         filter_result = self.hard_filter.evaluate(job)
+        filter_rejected = not filter_result.accepted
+        filter_reason = filter_result.reason or "hard_filter" if filter_rejected else None
         if not filter_result.accepted:
             report.hard_filtered += 1
             job.status = JobStatus.REJECTED
-            job.commercial_risks = [filter_result.reason or "hard_filter"]
+            job.commercial_risks = [filter_reason]
             self.repository.save(job, key)
-            return
 
         report.ai_requested += 1
-        evaluator = ControlledPolzaEvaluation(
-            self.repository,
-            self.ai,  # type: ignore[arg-type]
-            self.scoring,
-            self.telegram_score_threshold,
-            analysis_prompt_version=ANALYSIS_PROMPT_VERSION,
-            analyzer_version=ANALYZER_VERSION,
-            preserve_previous_analysis=True,
-        )
-        result = await evaluator.run([job])
-        if result.failures:
-            report.analysis_failed += 1
-            failure = result.failures[0]
-            self.repository.record_processing_error(
-                stage="analysis", error_kind="AIProviderError", message=failure.error, job_id=job.id
+        fallback = False
+        try:
+            evaluator = ControlledPolzaEvaluation(
+                self.repository,
+                self.ai,  # type: ignore[arg-type]
+                self.scoring,
+                self.telegram_score_threshold,
+                analysis_prompt_version=ANALYSIS_PROMPT_VERSION,
+                analyzer_version=ANALYZER_VERSION,
+                preserve_previous_analysis=True,
             )
-            return
+            result = await evaluator.run([job])
+            if result.failures:
+                fallback = True
+                report.analysis_failed += 1
+                failure = result.failures[0]
+                self.repository.record_processing_error(
+                    stage="analysis", error_kind="AIProviderError", message=failure.error, job_id=job.id
+                )
+                notification_job = self.repository.get(job.id) or job
+            else:
+                notification_job = result.jobs[0]
+                report.analyzed += 1
+        except Exception as exc:
+            fallback = True
+            report.analysis_failed += 1
+            self.repository.record_processing_error(
+                stage="analysis", error_kind=exc.__class__.__name__,
+                message=_safe_failure_message(exc), job_id=job.id,
+            )
+            logger.warning("Live Canary enrichment failed for job %s (%s)", job.id, exc.__class__.__name__)
+            notification_job = self.repository.get(job.id) or job
 
-        analyzed_job = result.jobs[0]
-        report.analyzed += 1
-        if analyzed_job.final_score is None or analyzed_job.final_score < self.telegram_score_threshold:
-            return
+        if filter_rejected:
+            notification_job.status = JobStatus.REJECTED
+            if filter_reason not in notification_job.commercial_risks:
+                notification_job.commercial_risks.append(filter_reason)
+            self.repository.save(notification_job, key)
 
-        await self._notify(analyzed_job, report)
+        await self._notify(notification_job, report, fallback=fallback)
 
-    async def _notify(self, analyzed_job: Job, report: LiveRunReport) -> None:
+    async def _notify(self, analyzed_job: Job, report: LiveRunReport, *, fallback: bool = False) -> None:
         report.telegram_eligible += 1
         if not self.repository.reserve_notification(analyzed_job.id, ANALYZER_VERSION):
             report.duplicate_notifications_skipped += 1
             return
         try:
-            sent = await self.telegram.notify(analyzed_job, self.scoring)
+            sent = await self.telegram.notify(analyzed_job, self.scoring, fallback=fallback)
         except Exception as exc:
             sent = False
             logger.warning("Telegram failure isolated for job %s (%s)", analyzed_job.id, exc.__class__.__name__)

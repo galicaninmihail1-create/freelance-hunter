@@ -13,7 +13,7 @@ from app.main import create_app
 from app.models import BudgetStatus, Job, RawJob, ResponseDraft
 from app.normalizer import normalize
 from app.scoring import ScoringEngine
-from app.services.live_canary import LiveCanaryService, NonOverlappingScheduler, TelegramActionService
+from app.services.live_canary import LiveCanaryService, LiveRunReport, NonOverlappingScheduler, TelegramActionService
 from app.services.polza_evaluation import ANALYZER_VERSION
 from app.telegram import TelegramClient
 
@@ -87,10 +87,14 @@ class FakeTelegram:
     def __init__(self, notify_result: bool = True):
         self.notify_result = notify_result
         self.notifications: list[str] = []
+        self.card_types: list[str] = []
+        self.job_snapshots: list[Job] = []
         self.texts: list[str] = []
 
-    async def notify(self, job: Job, scoring: ScoringEngine) -> bool:
+    async def notify(self, job: Job, scoring: ScoringEngine, *, fallback: bool = False) -> bool:
         self.notifications.append(job.id)
+        self.card_types.append("fallback" if fallback else "enriched")
+        self.job_snapshots.append(job.model_copy(deep=True))
         return self.notify_result
 
     async def send_text(self, text: str) -> bool:
@@ -150,7 +154,7 @@ def test_persistent_dedupe_across_repository_restart(settings: Settings) -> None
     assert restarted.exists(job.source, dedupe_key_for(job))
 
 
-def test_dry_run_is_read_only_and_reports_existing_eligibility(repository) -> None:
+def test_dry_run_is_read_only_and_reports_new_notification_candidates(repository) -> None:
     existing = analyzed_job("dry-existing")
     existing.final_score = 72
     existing.score_is_provisional = True
@@ -167,8 +171,9 @@ def test_dry_run_is_read_only_and_reports_existing_eligibility(repository) -> No
     assert report.duplicates == 1
     assert report.existing_analysis_telegram_eligible == 1
     assert report.new_jobs == 2
-    assert report.jobs_requiring_ai == 1
+    assert report.jobs_requiring_ai == 2
     assert report.hard_filtered == 1
+    assert report.new_notification_candidates == 2
     assert len(repository.list_all()) == 1
 
 
@@ -185,7 +190,32 @@ async def test_threshold_accepts_provisional_score_and_rejects_below_threshold(r
     high_threshold = LiveCanaryService(repository, HardFilter(), provider, ScoringEngine(), telegram, 90)
     second = await high_threshold.process_many([raw_job("below")])
     assert second.analyzed == 1
-    assert second.telegram_eligible == 0
+    assert second.telegram_eligible == 1
+    assert second.telegram_sent == 1
+    below = repository.get_by_dedupe("fl.ru", dedupe_key_for(normalize(raw_job("below"))))
+    assert below is not None and below.status.value == "REJECTED"
+    assert telegram.card_types == ["enriched", "enriched"]
+
+
+async def test_hard_filtered_job_keeps_classification_and_is_still_notified(repository) -> None:
+    provider = FakeProvider()
+    telegram = FakeTelegram()
+    service = LiveCanaryService(repository, HardFilter(), provider, ScoringEngine(), telegram, 50)
+    rejected = RawJob(
+        source="fl.ru", source_job_id="hard-rejected", title="Нужен курьер",
+        description="Разовая доставка бумажных документов по городу",
+    )
+
+    report = await service.process_many([rejected])
+
+    saved = repository.get_by_dedupe("fl.ru", dedupe_key_for(normalize(rejected)))
+    assert report.hard_filtered == 1
+    assert report.new_notification_candidates == 1
+    assert report.telegram_sent == 1
+    assert provider.analysis_calls == 1
+    assert telegram.card_types == ["enriched"]
+    assert saved is not None and saved.status.value == "REJECTED"
+    assert "outside_target_profile" in saved.commercial_risks
 
 
 async def test_cross_feed_duplicate_is_analyzed_and_notified_once(repository) -> None:
@@ -365,7 +395,8 @@ async def test_draft_request_is_idempotent(repository) -> None:
 
 async def test_polza_failure_isolated_and_next_job_continues(repository) -> None:
     provider = FakeProvider(fail_titles={"Fail Telegram CRM API"})
-    service = LiveCanaryService(repository, HardFilter(), provider, ScoringEngine(), FakeTelegram(), 50)
+    telegram = FakeTelegram()
+    service = LiveCanaryService(repository, HardFilter(), provider, ScoringEngine(), telegram, 50)
     report = await service.process_many([
         raw_job("fail", "Fail Telegram CRM API"),
         raw_job("success", "Success Telegram CRM API"),
@@ -373,7 +404,65 @@ async def test_polza_failure_isolated_and_next_job_continues(repository) -> None
     assert report.analysis_failed == 1
     assert report.analyzed == 1
     assert provider.analysis_calls == 2
+    assert report.telegram_sent == 2
+    assert telegram.card_types == ["fallback", "enriched"]
+    failed = repository.get_by_dedupe("fl.ru", dedupe_key_for(normalize(raw_job("fail", "Fail Telegram CRM API"))))
+    assert failed is not None and failed.status.value == "NEW"
     assert repository.list_processing_errors()[0]["stage"] == "analysis"
+
+
+async def test_invalid_structured_analysis_uses_fallback(repository) -> None:
+    provider = FakeProvider()
+    original_analyze = provider.analyze_job
+
+    async def invalid_structured(job: Job):
+        analysis = await original_analyze(job)
+        provider.last_structured_analysis = None
+        return analysis
+
+    provider.analyze_job = invalid_structured
+    telegram = FakeTelegram()
+    service = LiveCanaryService(repository, HardFilter(), provider, ScoringEngine(), telegram, 50)
+
+    report = await service.process_many([raw_job("invalid-structured")])
+
+    assert report.analysis_failed == 1
+    assert report.telegram_sent == 1
+    assert telegram.card_types == ["fallback"]
+    assert repository.list_processing_errors()[0]["stage"] == "analysis"
+
+
+async def test_unexpected_enrichment_exception_uses_fallback(repository) -> None:
+    provider = FakeProvider()
+
+    async def unexpected(job: Job):
+        provider.analysis_calls += 1
+        raise RuntimeError("unexpected enrichment failure")
+
+    provider.analyze_job = unexpected
+    telegram = FakeTelegram()
+    service = LiveCanaryService(repository, HardFilter(), provider, ScoringEngine(), telegram, 50)
+
+    report = await service.process_many([raw_job("unexpected-enrichment")])
+
+    assert report.analysis_failed == 1
+    assert report.telegram_sent == 1
+    assert telegram.card_types == ["fallback"]
+    assert repository.list_processing_errors()[0]["error_kind"] == "RuntimeError"
+
+
+async def test_existing_notification_reservation_blocks_second_attempt(repository) -> None:
+    job = analyzed_job("reserved")
+    repository.save(job, dedupe_key_for(job))
+    assert repository.reserve_notification(job.id, ANALYZER_VERSION)
+    telegram = FakeTelegram()
+    service = LiveCanaryService(repository, HardFilter(), FakeProvider(), ScoringEngine(), telegram, 50)
+    report = LiveRunReport()
+
+    await service._notify(job, report)
+
+    assert report.duplicate_notifications_skipped == 1
+    assert telegram.notifications == []
 
 
 async def test_telegram_failure_isolated_and_next_job_continues(repository) -> None:
@@ -383,6 +472,10 @@ async def test_telegram_failure_isolated_and_next_job_continues(repository) -> N
     assert report.analyzed == 2
     assert report.telegram_failed == 2
     assert len(telegram.notifications) == 2
+    for source_id in ("tg-fail-1", "tg-fail-2"):
+        saved = repository.get_by_dedupe("fl.ru", dedupe_key_for(normalize(raw_job(source_id))))
+        assert saved is not None
+        assert repository.notification_status(saved.id, ANALYZER_VERSION) == "failed"
     assert len([item for item in repository.list_processing_errors() if item["stage"] == "telegram"]) == 2
 
 
