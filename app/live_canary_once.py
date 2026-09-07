@@ -8,7 +8,9 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
+from io import TextIOBase
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -17,13 +19,56 @@ from app.collectors import FLRSSCollector
 from app.config import OFFICIAL_FL_RSS_NAMES, OFFICIAL_FL_RSS_URL, Settings
 from app.db import JobRepository, dedupe_key_for
 from app.filters import FilterSettings, HardFilter
-from app.models import Job, RawJob
+from app.models import BudgetStatus, Job, RawJob
 from app.normalizer import normalize
 from app.scoring import ScoringEngine
 from app.services.live_canary import LiveCanaryService, LiveRunReport
 from app.services.polza_evaluation import ANALYZER_VERSION
 from app.telegram import TelegramClient
-from app.telegram.client import _budget
+
+
+_CONSOLE_SUBSTITUTIONS = str.maketrans({"₽": "RUB", "$": "USD", "€": "EUR"})
+
+
+def console_safe(value: object, encoding: str | None = None) -> str:
+    """Return source-derived text that can always be written to the target console."""
+    text = str(value).translate(_CONSOLE_SUBSTITUTIONS)
+    target_encoding = encoding or "utf-8"
+    try:
+        return text.encode(target_encoding, errors="backslashreplace").decode(target_encoding)
+    except LookupError:
+        return text.encode("ascii", errors="backslashreplace").decode("ascii")
+
+
+def console_print(value: object = "", *, stream: TextIOBase | None = None) -> None:
+    target = stream or sys.stdout
+    safe_value = console_safe(value, getattr(target, "encoding", None))
+    try:
+        print(safe_value, file=target)
+    except UnicodeEncodeError:
+        print(console_safe(value, "ascii"), file=target)
+
+
+def _money(value: float) -> str:
+    return f"{value:,.0f}".replace(",", " ")
+
+
+def console_budget(job: Job) -> str:
+    """Format source budget for CLI telemetry only, using an ISO-like currency."""
+    if job.source_budget_status is BudgetStatus.UNKNOWN:
+        return "not provided in RSS"
+    if job.budget_min is None and job.budget_max is None:
+        return "not provided in RSS"
+    currency = (job.currency or "").strip().upper()
+    currency = {"RUR": "RUB", "₽": "RUB", "$": "USD", "€": "EUR"}.get(currency, currency)
+    suffix = f" {currency}" if currency else ""
+    if job.budget_min is not None and job.budget_max is not None:
+        if job.budget_min == job.budget_max:
+            return f"{_money(job.budget_min)}{suffix}"
+        return f"{_money(job.budget_min)}-{_money(job.budget_max)}{suffix}"
+    if job.budget_min is not None:
+        return f"from {_money(job.budget_min)}{suffix}"
+    return f"up to {_money(job.budget_max or 0)}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -205,51 +250,52 @@ def current_commit() -> str:
 def print_preflight(settings: Settings, max_new_jobs: int, verify_dedupe: bool, confirmed: bool) -> None:
     db_path = database_path(settings.database_url).resolve()
     env_path = (Path.cwd() / ".env").resolve()
-    print(f"Current commit: {current_commit()}")
-    print(f"DB path: {db_path}")
-    print(f"DB SHA-256 before: {sha256(db_path)}")
-    print(f".env timestamp: {env_path.stat().st_mtime_ns if env_path.exists() else 'missing'}")
-    print(f"Max new jobs: {max_new_jobs}")
-    print(f"Verify dedupe: {'yes' if verify_dedupe else 'no'}")
-    print(f"RSS feeds count: {len(settings.fl_rss_urls)}")
-    print(f"Polza: {'configured' if settings.polza_api_key else 'missing'}")
-    print(f"Telegram: {'configured' if settings.telegram_bot_token and settings.telegram_allowed_chat_id else 'missing'}")
-    print(f"Telegram destination explicitly confirmed: {'yes' if confirmed else 'no'}")
+    console_print(f"Current commit: {current_commit()}")
+    console_print(f"DB path: {db_path}")
+    console_print(f"DB SHA-256 before: {sha256(db_path)}")
+    console_print(f".env timestamp: {env_path.stat().st_mtime_ns if env_path.exists() else 'missing'}")
+    console_print(f"Max new jobs: {max_new_jobs}")
+    console_print(f"Verify dedupe: {'yes' if verify_dedupe else 'no'}")
+    console_print(f"RSS feeds count: {len(settings.fl_rss_urls)}")
+    console_print(f"Polza: {'configured' if settings.polza_api_key else 'missing'}")
+    console_print(f"Telegram: {'configured' if settings.telegram_bot_token and settings.telegram_allowed_chat_id else 'missing'}")
+    console_print(f"Telegram destination explicitly confirmed: {'yes' if confirmed else 'no'}")
 
 
 def print_execution(execution: CanaryExecution, runtime: CanaryRuntime) -> None:
     selection, run1 = execution.selection, execution.run1
     enriched = sum(job.analysis_analyzer_version == ANALYZER_VERSION for job in execution.jobs)
     fallback = len(execution.jobs) - enriched
-    print("Run 1:")
-    print(f"  fetched RSS items: {execution.fetched_items}")
-    print(f"  historical suppressed: {selection.historical_suppressed}")
-    print(f"  batch duplicates: {selection.batch_duplicates}")
-    print(f"  persistent duplicates: {selection.persistent_duplicates}")
-    print(f"  selected fixed candidates: {len(selection.selected)}")
-    print(f"  new unique processed: {run1.new_jobs}")
-    print(f"  enriched: {enriched}")
-    print(f"  fallback: {fallback}")
-    print(f"  Telegram sent: {run1.telegram_sent}")
-    print(f"  Telegram failed: {run1.telegram_failed}")
-    print(f"  processing errors added: {execution.processing_errors_added}")
+    console_print("Run 1:")
+    console_print(f"  fetched RSS items: {execution.fetched_items}")
+    console_print(f"  historical suppressed: {selection.historical_suppressed}")
+    console_print(f"  batch duplicates: {selection.batch_duplicates}")
+    console_print(f"  persistent duplicates: {selection.persistent_duplicates}")
+    console_print(f"  selected fixed candidates: {len(selection.selected)}")
+    console_print(f"  new unique processed: {run1.new_jobs}")
+    console_print(f"  enriched: {enriched}")
+    console_print(f"  fallback: {fallback}")
+    console_print(f"  Telegram sent: {run1.telegram_sent}")
+    console_print(f"  Telegram failed: {run1.telegram_failed}")
+    console_print(f"  processing errors added: {execution.processing_errors_added}")
     for job in execution.jobs:
         filter_result = runtime.service.hard_filter.evaluate(job)
-        print(f"Job {job.id}:")
-        print(f"  source: {job.source}")
-        print(f"  title: {job.title}")
-        print(f"  source URL: {job.url or 'missing'}")
-        print(f"  source budget: {_budget(job)}")
-        print(f"  hard filter: {'accepted' if filter_result.accepted else 'rejected'}")
-        print(f"  analytical status: {job.status.value}")
-        print(f"  score: {job.final_score if job.final_score is not None else 'missing'}")
-        print(f"  card: {'enriched' if job.analysis_analyzer_version == ANALYZER_VERSION else 'fallback'}")
-        print(f"  notification status: {runtime.repository.notification_status(job.id, ANALYZER_VERSION) or 'missing'}")
+        console_print(f"Job {job.id}:")
+        console_print(f"  source: {job.source}")
+        console_print(f"  category: {job.category or 'missing'}")
+        console_print(f"  title: {job.title}")
+        console_print(f"  source URL: {job.url or 'missing'}")
+        console_print(f"  source budget: {console_budget(job)}")
+        console_print(f"  hard filter: {'accepted' if filter_result.accepted else 'rejected'}")
+        console_print(f"  analytical status: {job.status.value}")
+        console_print(f"  score: {job.final_score if job.final_score is not None else 'missing'}")
+        console_print(f"  card: {'enriched' if job.analysis_analyzer_version == ANALYZER_VERSION else 'fallback'}")
+        console_print(f"  notification status: {runtime.repository.notification_status(job.id, ANALYZER_VERSION) or 'missing'}")
     if execution.run2 is not None:
-        print("Run 2:")
-        print(f"  persistent duplicates: {execution.run2.duplicates}")
-        print(f"  new unique processed: {execution.run2.new_jobs}")
-        print(f"  second Telegram attempts: {execution.run2.telegram_sent + execution.run2.telegram_failed}")
+        console_print("Run 2:")
+        console_print(f"  persistent duplicates: {execution.run2.duplicates}")
+        console_print(f"  new unique processed: {execution.run2.new_jobs}")
+        console_print(f"  second Telegram attempts: {execution.run2.telegram_sent + execution.run2.telegram_failed}")
 
 
 def main(
@@ -260,8 +306,8 @@ def main(
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.confirm_telegram_destination:
-        print("Telegram destination: configured")
-        print("Explicit confirmation: required")
+        console_print("Telegram destination: configured")
+        console_print("Explicit confirmation: required")
         parser.error("--confirm-telegram-destination is required before network access")
     settings = Settings.from_env()
     if not settings.telegram_bot_token or not settings.telegram_allowed_chat_id:
@@ -272,8 +318,8 @@ def main(
     print_execution(execution, runtime)
     db_path = database_path(settings.database_url).resolve()
     env_path = (Path.cwd() / ".env").resolve()
-    print(f"DB SHA-256 after: {sha256(db_path)}")
-    print(f".env timestamp after: {env_path.stat().st_mtime_ns if env_path.exists() else 'missing'}")
+    console_print(f"DB SHA-256 after: {sha256(db_path)}")
+    console_print(f".env timestamp after: {env_path.stat().st_mtime_ns if env_path.exists() else 'missing'}")
     return 0
 
 

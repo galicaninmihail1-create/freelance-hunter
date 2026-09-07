@@ -1,3 +1,4 @@
+import io
 from pathlib import Path
 
 import pytest
@@ -7,12 +8,15 @@ from app.db import dedupe_key_for
 from app.filters import HardFilter
 from app.live_canary_once import (
     CanaryRuntime,
+    console_budget,
+    console_print,
+    console_safe,
     execute_canary,
     main,
     print_preflight,
     select_fixed_candidates,
 )
-from app.models import Job, RawJob
+from app.models import BudgetStatus, Job, RawJob
 from app.normalizer import normalize
 from app.scoring import ScoringEngine
 from app.services.live_canary import LiveCanaryService
@@ -165,3 +169,55 @@ def test_preflight_does_not_print_credentials(tmp_path: Path, settings, capsys) 
     assert "CHAT-SHOULD-NOT-PRINT" not in output
     assert "Polza: configured" in output
     assert "Telegram: configured" in output
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("Бюджет 15 000 ₽", "Бюджет 15 000 RUB"),
+        ("Automation 🚀", r"Automation \U0001f680"),
+        ("API — integration “ready”", "API — integration “ready”"),
+    ],
+)
+def test_console_safe_handles_source_unicode_for_cp1251(source: str, expected: str) -> None:
+    assert console_safe(source, "cp1251") == expected
+
+
+def test_console_print_does_not_fail_with_cp1251_stdout() -> None:
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1251")
+    console_print("Заказ 🚀 — 15 000 ₽", stream=stream)
+    stream.flush()
+    output = raw.getvalue().decode("cp1251")
+    assert r"\U0001f680" in output
+    assert "15 000 RUB" in output
+
+
+def test_console_budget_uses_iso_currency_without_ruble_symbol() -> None:
+    job = Job(
+        source="fl.ru", title="Budget", budget_min=15000, budget_max=15000,
+        currency="RUB", source_budget_status=BudgetStatus.PROVIDED,
+    )
+    output = console_budget(job)
+    assert output == "15 000 RUB"
+    assert "₽" not in output
+
+
+def test_console_output_does_not_mutate_persisted_job_or_telegram_text(repository) -> None:
+    from app.telegram.client import format_fallback_job_message
+
+    title = "Интеграция 🚀 — бюджет 15 000 ₽"
+    job = Job(
+        source="fl.ru", source_job_id="unicode-job", title=title,
+        budget_min=15000, budget_max=15000, currency="RUB",
+        source_budget_status=BudgetStatus.PROVIDED,
+    )
+    telegram_before = format_fallback_job_message(job)
+    repository.save(job, dedupe_key_for(job))
+    console_print(job.title, stream=io.TextIOWrapper(io.BytesIO(), encoding="cp1251"))
+    persisted = repository.get_by_dedupe(job.source, dedupe_key_for(job))
+
+    assert persisted is not None and persisted.title == title
+    assert job.title == title
+    assert format_fallback_job_message(job) == telegram_before
+    assert "₽" in telegram_before
