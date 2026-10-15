@@ -19,6 +19,7 @@ The service never applies to jobs or contacts clients. FL.ru HTML scraping, Kwor
 ## Configuration
 
 Copy `.env.example` to `.env` and keep secrets out of source control.
+бвбфщфщои\хти 
 
 ```dotenv
 HUNTER_MODE=manual
