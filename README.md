@@ -1,5 +1,5 @@
 
-# Freelance Hunter  нуб
+# Freelance Hunter  про
 
 Monitored opportunity discovery for the official FL.ru “Business automation” RSS feed:
 
