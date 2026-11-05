@@ -1,5 +1,6 @@
 
-# Freelance Hunter  про
+# Freelance Hunter  хакер
+
 
 Monitored opportunity discovery for the official FL.ru “Business automation” RSS feed:
 
