@@ -1,5 +1,5 @@
 
-# Freelance Hunter  хакер 777
+# Freelance Hunter  хакер 67
 
 
 Monitored opportunity discovery for the official FL.ru “Business automation” RSS feed:
